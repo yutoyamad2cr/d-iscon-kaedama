@@ -484,14 +484,17 @@ func getIsuList(c echo.Context) error {
 		isuUUIDs = append(isuUUIDs, isu.JIAIsuUUID)
 	}
 
-	// 最新コンディションをウィンドウ関数で一括取得（MySQL 8.0以降）
+	// 最新コンディションをJOIN+サブクエリで取得
 	query, args, err := sqlx.In(`
-		SELECT * FROM (
-			SELECT *, ROW_NUMBER() OVER (PARTITION BY jia_isu_uuid ORDER BY timestamp DESC) AS rn
+		SELECT c.id, c.jia_isu_uuid, c.timestamp, c.is_sitting, c.condition, c.message
+		FROM isu_condition c
+		INNER JOIN (
+			SELECT jia_isu_uuid, MAX(timestamp) AS max_time
 			FROM isu_condition
 			WHERE jia_isu_uuid IN (?)
+			GROUP BY jia_isu_uuid
 		) t
-		WHERE t.rn = 1
+		ON c.jia_isu_uuid = t.jia_isu_uuid AND c.timestamp = t.max_time
 	`, isuUUIDs)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
