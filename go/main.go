@@ -452,17 +452,39 @@ func getIsuList(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	tx, err := db.Beginx()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	type IsuWithCondition struct {
+		Isu
+		ConditionID         sql.NullInt64     `db:"condition_id"`
+		ConditionTimestamp  sql.NullTime      `db:"condition_timestamp"`
+		ConditionIsSitting  sql.NullBool      `db:"condition_is_sitting"`
+		ConditionCondition  sql.NullString    `db:"condition_condition"`
+		ConditionMessage    sql.NullString    `db:"condition_message"`
 	}
-	defer tx.Rollback()
 
-	isuList := []Isu{}
-	err = tx.Select(
-		&isuList,
-		"SELECT * FROM `isu` WHERE `jia_user_id` = ? ORDER BY `id` DESC",
+	isuWithConditions := []IsuWithCondition{}
+	err = db.Select(
+		&isuWithConditions,
+		`SELECT 
+			i.*,
+			c.id AS condition_id,
+			c.timestamp AS condition_timestamp,
+			c.is_sitting AS condition_is_sitting,
+			c.condition AS condition_condition,
+			c.message AS condition_message
+		FROM isu i
+		LEFT JOIN (
+			SELECT 
+				jia_isu_uuid,
+				id,
+				timestamp,
+				is_sitting,
+				condition,
+				message,
+				ROW_NUMBER() OVER (PARTITION BY jia_isu_uuid ORDER BY timestamp DESC) as rn
+			FROM isu_condition
+		) c ON i.jia_isu_uuid = c.jia_isu_uuid AND c.rn = 1
+		WHERE i.jia_user_id = ? 
+		ORDER BY i.id DESC`,
 		jiaUserID)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
@@ -470,52 +492,33 @@ func getIsuList(c echo.Context) error {
 	}
 
 	responseList := []GetIsuListResponse{}
-	for _, isu := range isuList {
-		var lastCondition IsuCondition
-		foundLastCondition := true
-		err = tx.Get(&lastCondition, "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` DESC LIMIT 1",
-			isu.JIAIsuUUID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				foundLastCondition = false
-			} else {
-				c.Logger().Errorf("db error: %v", err)
-				return c.NoContent(http.StatusInternalServerError)
-			}
-		}
-
+	for _, isuWithCondition := range isuWithConditions {
 		var formattedCondition *GetIsuConditionResponse
-		if foundLastCondition {
-			conditionLevel, err := calculateConditionLevel(lastCondition.Condition)
+		if isuWithCondition.ConditionID.Valid {
+			conditionLevel, err := calculateConditionLevel(isuWithCondition.ConditionCondition.String)
 			if err != nil {
 				c.Logger().Error(err)
 				return c.NoContent(http.StatusInternalServerError)
 			}
 
 			formattedCondition = &GetIsuConditionResponse{
-				JIAIsuUUID:     lastCondition.JIAIsuUUID,
-				IsuName:        isu.Name,
-				Timestamp:      lastCondition.Timestamp.Unix(),
-				IsSitting:      lastCondition.IsSitting,
-				Condition:      lastCondition.Condition,
+				JIAIsuUUID:     isuWithCondition.JIAIsuUUID,
+				IsuName:        isuWithCondition.Name,
+				Timestamp:      isuWithCondition.ConditionTimestamp.Time.Unix(),
+				IsSitting:      isuWithCondition.ConditionIsSitting.Bool,
+				Condition:      isuWithCondition.ConditionCondition.String,
 				ConditionLevel: conditionLevel,
-				Message:        lastCondition.Message,
+				Message:        isuWithCondition.ConditionMessage.String,
 			}
 		}
 
 		res := GetIsuListResponse{
-			ID:                 isu.ID,
-			JIAIsuUUID:         isu.JIAIsuUUID,
-			Name:               isu.Name,
-			Character:          isu.Character,
+			ID:                 isuWithCondition.ID,
+			JIAIsuUUID:         isuWithCondition.JIAIsuUUID,
+			Name:               isuWithCondition.Name,
+			Character:          isuWithCondition.Character,
 			LatestIsuCondition: formattedCondition}
 		responseList = append(responseList, res)
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
 	}
 
 	return c.JSON(http.StatusOK, responseList)
