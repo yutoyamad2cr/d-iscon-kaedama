@@ -978,7 +978,21 @@ func getIsuConditions(c echo.Context) error {
 		startTime = time.Unix(startTimeInt64, 0)
 	}
 
-	conditionsResponse, err := getIsuConditionsFromDB(db, jiaIsuUUID, jiaUserID, endTime, conditionLevel, startTime, conditionLimit)
+	var isuName string
+	err = db.Get(&isuName,
+		"SELECT name FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?",
+		jiaIsuUUID, jiaUserID,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.String(http.StatusNotFound, "not found: isu")
+		}
+
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+
+	conditionsResponse, err := getIsuConditionsFromDB(db, jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
@@ -987,8 +1001,8 @@ func getIsuConditions(c echo.Context) error {
 }
 
 // ISUのコンディションをDBから取得
-func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, jiaUserID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
-	limit int) ([]*GetIsuConditionResponse, error) {
+func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
+	limit int, isuName string) ([]*GetIsuConditionResponse, error) {
 
 	// 条件レベルに応じたWHERE条件を構築
 	conditionWhere := ""
@@ -997,11 +1011,11 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, jiaUserID string, en
 		for level := range conditionLevel {
 			switch level {
 			case "info":
-				conditionClauses = append(conditionClauses, "(LENGTH(ic.`condition`) - LENGTH(REPLACE(ic.`condition`, 'true', '')) = 0)")
+				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) = 0)")
 			case "warning":
-				conditionClauses = append(conditionClauses, "(LENGTH(ic.`condition`) - LENGTH(REPLACE(ic.`condition`, 'true', '')) IN (4, 8))")
+				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) IN (4, 8))")
 			case "critical":
-				conditionClauses = append(conditionClauses, "(LENGTH(ic.`condition`) - LENGTH(REPLACE(ic.`condition`, 'true', '')) = 12)")
+				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) = 12)")
 			}
 		}
 		if len(conditionClauses) > 0 {
@@ -1009,55 +1023,31 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, jiaUserID string, en
 		}
 	}
 
-	type IsuConditionWithName struct {
-		IsuCondition
-		IsuName string `db:"isu_name"`
-	}
-
-	conditions := []IsuConditionWithName{}
+	conditions := []IsuCondition{}
 	var err error
 
 	if startTime.IsZero() {
 		err = db.Select(&conditions,
-			"SELECT ic.*, i.name as isu_name FROM `isu_condition` ic "+
-				"INNER JOIN `isu` i ON ic.jia_isu_uuid = i.jia_isu_uuid "+
-				"WHERE ic.`jia_isu_uuid` = ? AND i.`jia_user_id` = ?"+
-				"	AND ic.`timestamp` < ?"+
+			"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
+				"	AND `timestamp` < ?"+
 				conditionWhere+
-				"	ORDER BY ic.`timestamp` DESC"+
+				"	ORDER BY `timestamp` DESC"+
 				"   LIMIT ?",
-			jiaIsuUUID, jiaUserID, endTime, limit,
+			jiaIsuUUID, endTime, limit,
 		)
 	} else {
 		err = db.Select(&conditions,
-			"SELECT ic.*, i.name as isu_name FROM `isu_condition` ic "+
-				"INNER JOIN `isu` i ON ic.jia_isu_uuid = i.jia_isu_uuid "+
-				"WHERE ic.`jia_isu_uuid` = ? AND i.`jia_user_id` = ?"+
-				"	AND ic.`timestamp` < ?"+
-				"	AND ? <= ic.`timestamp`"+
+			"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
+				"	AND `timestamp` < ?"+
+				"	AND ? <= `timestamp`"+
 				conditionWhere+
-				"	ORDER BY ic.`timestamp` DESC"+
+				"	ORDER BY `timestamp` DESC"+
 				"   LIMIT ?",
-			jiaIsuUUID, jiaUserID, endTime, startTime, limit,
+			jiaIsuUUID, endTime, startTime, limit,
 		)
 	}
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("not found: isu")
-		}
 		return nil, fmt.Errorf("db error: %v", err)
-	}
-
-	if len(conditions) == 0 {
-		// ISUが存在しない場合をチェック
-		var count int
-		err = db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?", jiaIsuUUID, jiaUserID)
-		if err != nil {
-			return nil, fmt.Errorf("db error: %v", err)
-		}
-		if count == 0 {
-			return nil, fmt.Errorf("not found: isu")
-		}
 	}
 
 	conditionsResponse := []*GetIsuConditionResponse{}
@@ -1069,7 +1059,7 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, jiaUserID string, en
 
 		data := GetIsuConditionResponse{
 			JIAIsuUUID:     c.JIAIsuUUID,
-			IsuName:        c.IsuName,
+			IsuName:        isuName,
 			Timestamp:      c.Timestamp.Unix(),
 			IsSitting:      c.IsSitting,
 			Condition:      c.Condition,
