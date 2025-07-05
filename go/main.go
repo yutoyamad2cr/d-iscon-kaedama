@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -51,6 +52,15 @@ var (
 
 	postIsuConditionTargetBaseURL string // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
 )
+
+// ISUアイコンキャッシュ用構造体
+// 画像データとキャッシュ時刻
+var isuIconCache sync.Map // map[string]isuIconCacheEntry
+
+type isuIconCacheEntry struct {
+	Image    []byte
+	CachedAt time.Time
+}
 
 type Config struct {
 	Name string `db:"name"`
@@ -253,6 +263,10 @@ func main() {
 		e.Logger.Fatalf("missing: POST_ISUCONDITION_TARGET_BASE_URL")
 		return
 	}
+
+	// DBコネクションプールの最適化
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(25)
 
 	serverPort := fmt.Sprintf(":%v", getEnv("SERVER_APP_PORT", "3000"))
 	e.Logger.Fatal(e.Start(serverPort))
@@ -705,6 +719,22 @@ func getIsuIcon(c echo.Context) error {
 
 	jiaIsuUUID := c.Param("jia_isu_uuid")
 
+	// キャッシュ参照
+	if v, ok := isuIconCache.Load(jiaIsuUUID); ok {
+		entry := v.(isuIconCacheEntry)
+		if time.Since(entry.CachedAt) < 24*time.Hour {
+			contentType := http.DetectContentType(entry.Image)
+			if !strings.HasPrefix(contentType, "image/") {
+				contentType = "application/octet-stream"
+			}
+			c.Response().Header().Set("Cache-Control", "public, max-age=86400")
+			return c.Blob(http.StatusOK, contentType, entry.Image)
+		} else {
+			// 有効期限切れは削除
+			isuIconCache.Delete(jiaIsuUUID)
+		}
+	}
+
 	var image []byte
 	err = db.Get(&image, "SELECT `image` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
 		jiaUserID, jiaIsuUUID)
@@ -716,6 +746,12 @@ func getIsuIcon(c echo.Context) error {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
+
+	// キャッシュ格納
+	isuIconCache.Store(jiaIsuUUID, isuIconCacheEntry{
+		Image:    image,
+		CachedAt: time.Now(),
+	})
 
 	// Content-Type推定（JPEG/PNGのみ対応、他はoctet-stream）
 	contentType := http.DetectContentType(image)
@@ -1020,7 +1056,6 @@ func getIsuConditions(c echo.Context) error {
 // ISUのコンディションをDBから取得
 func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
 	limit int, isuName string) ([]*GetIsuConditionResponse, error) {
-
 	// 条件レベルに応じたWHERE条件を構築
 	conditionWhere := ""
 	if len(conditionLevel) > 0 {
@@ -1040,25 +1075,31 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 		}
 	}
 
-	conditions := []IsuCondition{}
+	conditions := []struct {
+		JIAIsuUUID string    `db:"jia_isu_uuid"`
+		Timestamp  time.Time `db:"timestamp"`
+		IsSitting  bool      `db:"is_sitting"`
+		Condition  string    `db:"condition"`
+		Message    string    `db:"message"`
+	}{}
 	var err error
 
 	if startTime.IsZero() {
 		err = db.Select(&conditions,
-			"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
-				"	AND `timestamp` < ?"+
+			"SELECT jia_isu_uuid, timestamp, is_sitting, condition, message FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
+				"\tAND `timestamp` < ?"+
 				conditionWhere+
-				"	ORDER BY `timestamp` DESC"+
+				"\tORDER BY `timestamp` DESC"+
 				"   LIMIT ?",
 			jiaIsuUUID, endTime, limit,
 		)
 	} else {
 		err = db.Select(&conditions,
-			"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
-				"	AND `timestamp` < ?"+
-				"	AND ? <= `timestamp`"+
+			"SELECT jia_isu_uuid, timestamp, is_sitting, condition, message FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
+				"\tAND `timestamp` < ?"+
+				"\tAND ? <= `timestamp`"+
 				conditionWhere+
-				"	ORDER BY `timestamp` DESC"+
+				"\tORDER BY `timestamp` DESC"+
 				"   LIMIT ?",
 			jiaIsuUUID, endTime, startTime, limit,
 		)
@@ -1073,7 +1114,6 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 		if err != nil {
 			continue
 		}
-
 		data := GetIsuConditionResponse{
 			JIAIsuUUID:     c.JIAIsuUUID,
 			IsuName:        isuName,
@@ -1085,7 +1125,6 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 		}
 		conditionsResponse = append(conditionsResponse, &data)
 	}
-
 	return conditionsResponse, nil
 }
 
