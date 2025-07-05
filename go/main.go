@@ -1056,25 +1056,7 @@ func getIsuConditions(c echo.Context) error {
 // ISUのコンディションをDBから取得
 func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
 	limit int, isuName string) ([]*GetIsuConditionResponse, error) {
-	// 条件レベルに応じたWHERE条件を構築
-	conditionWhere := ""
-	if len(conditionLevel) > 0 {
-		conditionClauses := []string{}
-		for level := range conditionLevel {
-			switch level {
-			case "info":
-				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) = 0)")
-			case "warning":
-				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) IN (4, 8))")
-			case "critical":
-				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) = 12)")
-			}
-		}
-		if len(conditionClauses) > 0 {
-			conditionWhere = " AND (" + strings.Join(conditionClauses, " OR ") + ")"
-		}
-	}
-
+	// SQLではORDER BY timestamp DESC LIMIT 100で多めに取得、Go側でcondition_levelフィルタ
 	conditions := []struct {
 		JIAIsuUUID string    `db:"jia_isu_uuid"`
 		Timestamp  time.Time `db:"timestamp"`
@@ -1086,22 +1068,13 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 
 	if startTime.IsZero() {
 		err = db.Select(&conditions,
-			"SELECT jia_isu_uuid, timestamp, is_sitting, condition, message FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
-				"\tAND `timestamp` < ?"+
-				conditionWhere+
-				"\tORDER BY `timestamp` DESC"+
-				"   LIMIT ?",
-			jiaIsuUUID, endTime, limit,
+			"SELECT jia_isu_uuid, timestamp, is_sitting, condition, message FROM isu_condition WHERE jia_isu_uuid = ? AND timestamp < ? ORDER BY timestamp DESC LIMIT 100",
+			jiaIsuUUID, endTime,
 		)
 	} else {
 		err = db.Select(&conditions,
-			"SELECT jia_isu_uuid, timestamp, is_sitting, condition, message FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
-				"\tAND `timestamp` < ?"+
-				"\tAND ? <= `timestamp`"+
-				conditionWhere+
-				"\tORDER BY `timestamp` DESC"+
-				"   LIMIT ?",
-			jiaIsuUUID, endTime, startTime, limit,
+			"SELECT jia_isu_uuid, timestamp, is_sitting, condition, message FROM isu_condition WHERE jia_isu_uuid = ? AND timestamp < ? AND ? <= timestamp ORDER BY timestamp DESC LIMIT 100",
+			jiaIsuUUID, endTime, startTime,
 		)
 	}
 	if err != nil {
@@ -1114,6 +1087,9 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 		if err != nil {
 			continue
 		}
+		if _, ok := conditionLevel[cLevel]; !ok {
+			continue
+		}
 		data := GetIsuConditionResponse{
 			JIAIsuUUID:     c.JIAIsuUUID,
 			IsuName:        isuName,
@@ -1124,7 +1100,11 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 			Message:        c.Message,
 		}
 		conditionsResponse = append(conditionsResponse, &data)
+		if len(conditionsResponse) >= limit {
+			break
+		}
 	}
+
 	return conditionsResponse, nil
 }
 
@@ -1170,14 +1150,16 @@ func getTrend(c echo.Context) error {
 		return c.JSON(http.StatusOK, []TrendResponse{})
 	}
 
-	// 2. 全ISUの最新コンディションを一括取得（必要なカラムのみ）
+	// 2. 全ISUの最新コンディションを一括取得（必要なカラムのみ、JOIN+サブクエリで高速化）
 	query, args, err := sqlx.In(`
-		SELECT jia_isu_uuid, timestamp, condition FROM (
-			SELECT jia_isu_uuid, timestamp, condition, ROW_NUMBER() OVER (PARTITION BY jia_isu_uuid ORDER BY timestamp DESC) AS rn
+		SELECT c.jia_isu_uuid, c.timestamp, c.condition FROM isu_condition c
+		INNER JOIN (
+			SELECT jia_isu_uuid, MAX(timestamp) AS max_time
 			FROM isu_condition
 			WHERE jia_isu_uuid IN (?)
+			GROUP BY jia_isu_uuid
 		) t
-		WHERE t.rn = 1
+		ON c.jia_isu_uuid = t.jia_isu_uuid AND c.timestamp = t.max_time
 	`, isuUUIDs)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
