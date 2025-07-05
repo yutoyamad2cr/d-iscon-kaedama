@@ -244,7 +244,7 @@ func main() {
 		e.Logger.Fatalf("failed to connect db: %v", err)
 		return
 	}
-	db.SetMaxOpenConns(10)
+	// db.SetMaxOpenConns(10)
 
 	defer db.Close()
 
