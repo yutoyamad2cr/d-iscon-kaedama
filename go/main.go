@@ -1102,10 +1102,10 @@ func getTrend(c echo.Context) error {
 		return c.JSON(http.StatusOK, []TrendResponse{})
 	}
 
-	// 2. 全ISUの最新コンディションを一括取得
+	// 2. 全ISUの最新コンディションを一括取得（必要なカラムのみ）
 	query, args, err := sqlx.In(`
-		SELECT * FROM (
-			SELECT *, ROW_NUMBER() OVER (PARTITION BY jia_isu_uuid ORDER BY timestamp DESC) AS rn
+		SELECT jia_isu_uuid, timestamp, condition FROM (
+			SELECT jia_isu_uuid, timestamp, condition, ROW_NUMBER() OVER (PARTITION BY jia_isu_uuid ORDER BY timestamp DESC) AS rn
 			FROM isu_condition
 			WHERE jia_isu_uuid IN (?)
 		) t
@@ -1117,7 +1117,12 @@ func getTrend(c echo.Context) error {
 	}
 	query = db.Rebind(query)
 
-	latestConditions := []IsuCondition{}
+	type TrendConditionRaw struct {
+		JIAIsuUUID string    `db:"jia_isu_uuid"`
+		Timestamp  time.Time `db:"timestamp"`
+		Condition  string    `db:"condition"`
+	}
+	latestConditions := []TrendConditionRaw{}
 	err = db.Select(&latestConditions, query, args...)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
@@ -1125,7 +1130,7 @@ func getTrend(c echo.Context) error {
 	}
 
 	// 3. UUID→最新コンディションのmap
-	conditionMap := make(map[string]IsuCondition)
+	conditionMap := make(map[string]TrendConditionRaw)
 	for _, cond := range latestConditions {
 		conditionMap[cond.JIAIsuUUID] = cond
 	}
