@@ -452,71 +452,77 @@ func getIsuList(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	type IsuWithCondition struct {
-		Isu
-		ConditionID         sql.NullInt64     `db:"condition_id"`
-		ConditionTimestamp  sql.NullTime      `db:"condition_timestamp"`
-		ConditionIsSitting  sql.NullBool      `db:"condition_is_sitting"`
-		ConditionCondition  sql.NullString    `db:"condition_condition"`
-		ConditionMessage    sql.NullString    `db:"condition_message"`
-	}
-
-	isuWithConditions := []IsuWithCondition{}
+	isuList := []Isu{}
 	err = db.Select(
-		&isuWithConditions,
-		`SELECT 
-			i.*,
-			c.id AS condition_id,
-			c.timestamp AS condition_timestamp,
-			c.is_sitting AS condition_is_sitting,
-			c.condition AS condition_condition,
-			c.message AS condition_message
-		FROM isu i
-		LEFT JOIN (
-			SELECT 
-				jia_isu_uuid,
-				id,
-				timestamp,
-				is_sitting,
-				condition,
-				message,
-				ROW_NUMBER() OVER (PARTITION BY jia_isu_uuid ORDER BY timestamp DESC) as rn
-			FROM isu_condition
-		) c ON i.jia_isu_uuid = c.jia_isu_uuid AND c.rn = 1
-		WHERE i.jia_user_id = ? 
-		ORDER BY i.id DESC`,
+		&isuList,
+		"SELECT * FROM `isu` WHERE `jia_user_id` = ? ORDER BY `id` DESC",
 		jiaUserID)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	// ISUのUUIDリストを作成
+	jiaIsuUUIDs := make([]string, len(isuList))
+	for i, isu := range isuList {
+		jiaIsuUUIDs[i] = isu.JIAIsuUUID
+	}
+
+	// 全ISUの最新コンディションを一度に取得
+	latestConditions := make(map[string]IsuCondition)
+	if len(jiaIsuUUIDs) > 0 {
+		conditions := []IsuCondition{}
+		placeholders := strings.Repeat("?,", len(jiaIsuUUIDs)-1) + "?"
+		args := make([]interface{}, len(jiaIsuUUIDs))
+		for i, uuid := range jiaIsuUUIDs {
+			args[i] = uuid
+		}
+		
+		err = db.Select(&conditions,
+			`SELECT ic1.* FROM isu_condition ic1
+			INNER JOIN (
+				SELECT jia_isu_uuid, MAX(timestamp) as max_timestamp
+				FROM isu_condition
+				WHERE jia_isu_uuid IN (`+placeholders+`)
+				GROUP BY jia_isu_uuid
+			) ic2 ON ic1.jia_isu_uuid = ic2.jia_isu_uuid AND ic1.timestamp = ic2.max_timestamp`,
+			args...)
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+
+		for _, condition := range conditions {
+			latestConditions[condition.JIAIsuUUID] = condition
+		}
+	}
+
 	responseList := []GetIsuListResponse{}
-	for _, isuWithCondition := range isuWithConditions {
+	for _, isu := range isuList {
 		var formattedCondition *GetIsuConditionResponse
-		if isuWithCondition.ConditionID.Valid {
-			conditionLevel, err := calculateConditionLevel(isuWithCondition.ConditionCondition.String)
+		if lastCondition, exists := latestConditions[isu.JIAIsuUUID]; exists {
+			conditionLevel, err := calculateConditionLevel(lastCondition.Condition)
 			if err != nil {
 				c.Logger().Error(err)
 				return c.NoContent(http.StatusInternalServerError)
 			}
 
 			formattedCondition = &GetIsuConditionResponse{
-				JIAIsuUUID:     isuWithCondition.JIAIsuUUID,
-				IsuName:        isuWithCondition.Name,
-				Timestamp:      isuWithCondition.ConditionTimestamp.Time.Unix(),
-				IsSitting:      isuWithCondition.ConditionIsSitting.Bool,
-				Condition:      isuWithCondition.ConditionCondition.String,
+				JIAIsuUUID:     lastCondition.JIAIsuUUID,
+				IsuName:        isu.Name,
+				Timestamp:      lastCondition.Timestamp.Unix(),
+				IsSitting:      lastCondition.IsSitting,
+				Condition:      lastCondition.Condition,
 				ConditionLevel: conditionLevel,
-				Message:        isuWithCondition.ConditionMessage.String,
+				Message:        lastCondition.Message,
 			}
 		}
 
 		res := GetIsuListResponse{
-			ID:                 isuWithCondition.ID,
-			JIAIsuUUID:         isuWithCondition.JIAIsuUUID,
-			Name:               isuWithCondition.Name,
-			Character:          isuWithCondition.Character,
+			ID:                 isu.ID,
+			JIAIsuUUID:         isu.JIAIsuUUID,
+			Name:               isu.Name,
+			Character:          isu.Character,
 			LatestIsuCondition: formattedCondition}
 		responseList = append(responseList, res)
 	}
