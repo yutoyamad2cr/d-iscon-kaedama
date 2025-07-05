@@ -30,6 +30,12 @@ CREATE TABLE `isu_condition` (
   INDEX `idx_jia_isu_uuid_timestamp` (`jia_isu_uuid`, `timestamp`)
 ) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4;
 
+ALTER TABLE `isu_condition`
+  ADD CONSTRAINT `fk_isu_condition_jia_isu_uuid`
+  FOREIGN KEY (`jia_isu_uuid`) REFERENCES `isu`(`jia_isu_uuid`)
+  ON DELETE CASCADE
+  ON UPDATE CASCADE;
+
 CREATE TABLE `user` (
   `jia_user_id` VARCHAR(255) PRIMARY KEY,
   `created_at` DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)
