@@ -479,7 +479,8 @@ func getIsuList(c echo.Context) error {
 		return c.JSON(http.StatusOK, []GetIsuListResponse{})
 	}
 
-	isuUUIDs := make([]interface{}, 0, len(isuList))
+	// isuUUIDsを[]stringで作成
+	isuUUIDs := make([]string, 0, len(isuList))
 	for _, isu := range isuList {
 		isuUUIDs = append(isuUUIDs, isu.JIAIsuUUID)
 	}
@@ -505,7 +506,7 @@ func getIsuList(c echo.Context) error {
 	latestConditions := []IsuCondition{}
 	err = db.Select(&latestConditions, query, args...)
 	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
+		c.Logger().Errorf("db error (Select latestConditions): %v, query: %s, args: %+v", err, query, args)
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
@@ -1143,7 +1144,7 @@ func getTrend(c echo.Context) error {
 
 	// characterごとにISUを分類
 	characterToIsu := make(map[string][]Isu)
-	isuUUIDs := make([]interface{}, 0, len(isuList))
+	isuUUIDs := make([]string, 0, len(isuList))
 	for _, isu := range isuList {
 		characterToIsu[isu.Character] = append(characterToIsu[isu.Character], isu)
 		isuUUIDs = append(isuUUIDs, isu.JIAIsuUUID)
