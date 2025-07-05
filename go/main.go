@@ -244,7 +244,8 @@ func main() {
 		e.Logger.Fatalf("failed to connect db: %v", err)
 		return
 	}
-	db.SetMaxOpenConns(10)
+	// db.SetMaxOpenConns(10)
+
 	defer db.Close()
 
 	postIsuConditionTargetBaseURL = os.Getenv("POST_ISUCONDITION_TARGET_BASE_URL")
@@ -716,7 +717,16 @@ func getIsuIcon(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	return c.Blob(http.StatusOK, "", image)
+	// Content-Type推定（JPEG/PNGのみ対応、他はoctet-stream）
+	contentType := http.DetectContentType(image)
+	if !strings.HasPrefix(contentType, "image/") {
+		contentType = "application/octet-stream"
+	}
+
+	// Cache-Controlヘッダ付与（1日キャッシュ）
+	c.Response().Header().Set("Cache-Control", "public, max-age=86400")
+
+	return c.Blob(http.StatusOK, contentType, image)
 }
 
 // GET /api/isu/:jia_isu_uuid/graph
@@ -743,6 +753,8 @@ func getIsuGraph(c echo.Context) error {
 	}
 	date := time.Unix(datetimeInt64, 0).Truncate(time.Hour)
 
+	now := time.Now() // 未来データ除外用
+
 	tx, err := db.Beginx()
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
@@ -761,7 +773,7 @@ func getIsuGraph(c echo.Context) error {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
-	res, err := generateIsuGraphResponse(tx, jiaIsuUUID, date)
+	res, err := generateIsuGraphResponse(tx, jiaIsuUUID, date, now)
 	if err != nil {
 		c.Logger().Error(err)
 		return c.NoContent(http.StatusInternalServerError)
@@ -777,14 +789,15 @@ func getIsuGraph(c echo.Context) error {
 }
 
 // グラフのデータ点を一日分生成
-func generateIsuGraphResponse(tx *sqlx.Tx, jiaIsuUUID string, graphDate time.Time) ([]GraphResponse, error) {
+func generateIsuGraphResponse(tx *sqlx.Tx, jiaIsuUUID string, graphDate time.Time, now time.Time) ([]GraphResponse, error) {
 	dataPoints := []GraphDataPointWithInfo{}
 	conditionsInThisHour := []IsuCondition{}
 	timestampsInThisHour := []int64{}
 	var startTimeInThisHour time.Time
 	var condition IsuCondition
 
-	rows, err := tx.Queryx("SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` ASC", jiaIsuUUID)
+	// 未来データ除外: timestamp <= now
+	rows, err := tx.Queryx("SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? AND `timestamp` <= ? ORDER BY `timestamp` ASC", jiaIsuUUID, now)
 	if err != nil {
 		return nil, fmt.Errorf("db error: %v", err)
 	}
@@ -1098,81 +1111,98 @@ func calculateConditionLevel(condition string) (string, error) {
 // GET /api/trend
 // ISUの性格毎の最新のコンディション情報
 func getTrend(c echo.Context) error {
-	characterList := []Isu{}
-	err := db.Select(&characterList, "SELECT `character` FROM `isu` GROUP BY `character`")
+	// 1. 全characterごとにISU一覧を一括取得
+	isuList := []Isu{}
+	err := db.Select(&isuList, "SELECT id, jia_isu_uuid, character FROM isu")
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	res := []TrendResponse{}
-
-	for _, character := range characterList {
-		isuList := []Isu{}
-		err = db.Select(&isuList,
-			"SELECT * FROM `isu` WHERE `character` = ?",
-			character.Character,
-		)
-		if err != nil {
-			c.Logger().Errorf("db error: %v", err)
-			return c.NoContent(http.StatusInternalServerError)
-		}
-
-		characterInfoIsuConditions := []*TrendCondition{}
-		characterWarningIsuConditions := []*TrendCondition{}
-		characterCriticalIsuConditions := []*TrendCondition{}
-		for _, isu := range isuList {
-			conditions := []IsuCondition{}
-			err = db.Select(&conditions,
-				"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY timestamp DESC",
-				isu.JIAIsuUUID,
-			)
-			if err != nil {
-				c.Logger().Errorf("db error: %v", err)
-				return c.NoContent(http.StatusInternalServerError)
-			}
-
-			if len(conditions) > 0 {
-				isuLastCondition := conditions[0]
-				conditionLevel, err := calculateConditionLevel(isuLastCondition.Condition)
-				if err != nil {
-					c.Logger().Error(err)
-					return c.NoContent(http.StatusInternalServerError)
-				}
-				trendCondition := TrendCondition{
-					ID:        isu.ID,
-					Timestamp: isuLastCondition.Timestamp.Unix(),
-				}
-				switch conditionLevel {
-				case "info":
-					characterInfoIsuConditions = append(characterInfoIsuConditions, &trendCondition)
-				case "warning":
-					characterWarningIsuConditions = append(characterWarningIsuConditions, &trendCondition)
-				case "critical":
-					characterCriticalIsuConditions = append(characterCriticalIsuConditions, &trendCondition)
-				}
-			}
-
-		}
-
-		sort.Slice(characterInfoIsuConditions, func(i, j int) bool {
-			return characterInfoIsuConditions[i].Timestamp > characterInfoIsuConditions[j].Timestamp
-		})
-		sort.Slice(characterWarningIsuConditions, func(i, j int) bool {
-			return characterWarningIsuConditions[i].Timestamp > characterWarningIsuConditions[j].Timestamp
-		})
-		sort.Slice(characterCriticalIsuConditions, func(i, j int) bool {
-			return characterCriticalIsuConditions[i].Timestamp > characterCriticalIsuConditions[j].Timestamp
-		})
-		res = append(res,
-			TrendResponse{
-				Character: character.Character,
-				Info:      characterInfoIsuConditions,
-				Warning:   characterWarningIsuConditions,
-				Critical:  characterCriticalIsuConditions,
-			})
+	// characterごとにISUを分類
+	characterToIsu := make(map[string][]Isu)
+	isuUUIDs := make([]interface{}, 0, len(isuList))
+	for _, isu := range isuList {
+		characterToIsu[isu.Character] = append(characterToIsu[isu.Character], isu)
+		isuUUIDs = append(isuUUIDs, isu.JIAIsuUUID)
 	}
 
+	if len(isuUUIDs) == 0 {
+		return c.JSON(http.StatusOK, []TrendResponse{})
+	}
+
+	// 2. 全ISUの最新コンディションを一括取得（必要なカラムのみ）
+	query, args, err := sqlx.In(`
+		SELECT jia_isu_uuid, timestamp, condition FROM (
+			SELECT jia_isu_uuid, timestamp, condition, ROW_NUMBER() OVER (PARTITION BY jia_isu_uuid ORDER BY timestamp DESC) AS rn
+			FROM isu_condition
+			WHERE jia_isu_uuid IN (?)
+		) t
+		WHERE t.rn = 1
+	`, isuUUIDs)
+	if err != nil {
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	query = db.Rebind(query)
+
+	type TrendConditionRaw struct {
+		JIAIsuUUID string    `db:"jia_isu_uuid"`
+		Timestamp  time.Time `db:"timestamp"`
+		Condition  string    `db:"condition"`
+	}
+	latestConditions := []TrendConditionRaw{}
+	err = db.Select(&latestConditions, query, args...)
+	if err != nil {
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+
+	// 3. UUID→最新コンディションのmap
+	conditionMap := make(map[string]TrendConditionRaw)
+	for _, cond := range latestConditions {
+		conditionMap[cond.JIAIsuUUID] = cond
+	}
+
+	// 4. characterごとにTrendResponseを組み立て
+	res := []TrendResponse{}
+	for character, isus := range characterToIsu {
+		infoList := []*TrendCondition{}
+		warningList := []*TrendCondition{}
+		criticalList := []*TrendCondition{}
+		for _, isu := range isus {
+			cond, ok := conditionMap[isu.JIAIsuUUID]
+			if !ok {
+				continue
+			}
+			level, err := calculateConditionLevel(cond.Condition)
+			if err != nil {
+				continue
+			}
+			trendCond := &TrendCondition{
+				ID:        isu.ID,
+				Timestamp: cond.Timestamp.Unix(),
+			}
+			switch level {
+			case "info":
+				infoList = append(infoList, trendCond)
+			case "warning":
+				warningList = append(warningList, trendCond)
+			case "critical":
+				criticalList = append(criticalList, trendCond)
+			}
+		}
+		// 新しい順にソート
+		sort.Slice(infoList, func(i, j int) bool { return infoList[i].Timestamp > infoList[j].Timestamp })
+		sort.Slice(warningList, func(i, j int) bool { return warningList[i].Timestamp > warningList[j].Timestamp })
+		sort.Slice(criticalList, func(i, j int) bool { return criticalList[i].Timestamp > criticalList[j].Timestamp })
+		res = append(res, TrendResponse{
+			Character: character,
+			Info:      infoList,
+			Warning:   warningList,
+			Critical:  criticalList,
+		})
+	}
 	return c.JSON(http.StatusOK, res)
 }
 
