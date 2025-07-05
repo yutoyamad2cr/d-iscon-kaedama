@@ -717,7 +717,16 @@ func getIsuIcon(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	return c.Blob(http.StatusOK, "", image)
+	// Content-Type推定（JPEG/PNGのみ対応、他はoctet-stream）
+	contentType := http.DetectContentType(image)
+	if !strings.HasPrefix(contentType, "image/") {
+		contentType = "application/octet-stream"
+	}
+
+	// Cache-Controlヘッダ付与（1日キャッシュ）
+	c.Response().Header().Set("Cache-Control", "public, max-age=86400")
+
+	return c.Blob(http.StatusOK, contentType, image)
 }
 
 // GET /api/isu/:jia_isu_uuid/graph
