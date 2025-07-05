@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -51,6 +52,15 @@ var (
 
 	postIsuConditionTargetBaseURL string // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
 )
+
+// ISUアイコンキャッシュ用構造体
+// 画像データとキャッシュ時刻
+var isuIconCache sync.Map // map[string]isuIconCacheEntry
+
+type isuIconCacheEntry struct {
+	Image    []byte
+	CachedAt time.Time
+}
 
 type Config struct {
 	Name string `db:"name"`
@@ -477,7 +487,7 @@ func getIsuList(c echo.Context) error {
 		for i, uuid := range jiaIsuUUIDs {
 			args[i] = uuid
 		}
-		
+
 		err = db.Select(&conditions,
 			`SELECT ic1.* FROM isu_condition ic1
 			INNER JOIN (
@@ -709,6 +719,22 @@ func getIsuIcon(c echo.Context) error {
 
 	jiaIsuUUID := c.Param("jia_isu_uuid")
 
+	// キャッシュ参照
+	if v, ok := isuIconCache.Load(jiaIsuUUID); ok {
+		entry := v.(isuIconCacheEntry)
+		if time.Since(entry.CachedAt) < 24*time.Hour {
+			contentType := http.DetectContentType(entry.Image)
+			if !strings.HasPrefix(contentType, "image/") {
+				contentType = "application/octet-stream"
+			}
+			c.Response().Header().Set("Cache-Control", "public, max-age=86400")
+			return c.Blob(http.StatusOK, contentType, entry.Image)
+		} else {
+			// 有効期限切れは削除
+			isuIconCache.Delete(jiaIsuUUID)
+		}
+	}
+
 	var image []byte
 	err = db.Get(&image, "SELECT `image` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
 		jiaUserID, jiaIsuUUID)
@@ -748,6 +774,8 @@ func getIsuGraph(c echo.Context) error {
 	}
 	date := time.Unix(datetimeInt64, 0).Truncate(time.Hour)
 
+	now := time.Now() // 未来データ除外用
+
 	tx, err := db.Beginx()
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
@@ -766,7 +794,7 @@ func getIsuGraph(c echo.Context) error {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
-	res, err := generateIsuGraphResponse(tx, jiaIsuUUID, date)
+	res, err := generateIsuGraphResponse(tx, jiaIsuUUID, date, now)
 	if err != nil {
 		c.Logger().Error(err)
 		return c.NoContent(http.StatusInternalServerError)
@@ -782,14 +810,15 @@ func getIsuGraph(c echo.Context) error {
 }
 
 // グラフのデータ点を一日分生成
-func generateIsuGraphResponse(tx *sqlx.Tx, jiaIsuUUID string, graphDate time.Time) ([]GraphResponse, error) {
+func generateIsuGraphResponse(tx *sqlx.Tx, jiaIsuUUID string, graphDate time.Time, now time.Time) ([]GraphResponse, error) {
 	dataPoints := []GraphDataPointWithInfo{}
 	conditionsInThisHour := []IsuCondition{}
 	timestampsInThisHour := []int64{}
 	var startTimeInThisHour time.Time
 	var condition IsuCondition
 
-	rows, err := tx.Queryx("SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` ASC", jiaIsuUUID)
+	// 未来データ除外: timestamp <= now
+	rows, err := tx.Queryx("SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? AND `timestamp` <= ? ORDER BY `timestamp` ASC", jiaIsuUUID, now)
 	if err != nil {
 		return nil, fmt.Errorf("db error: %v", err)
 	}
@@ -1013,25 +1042,6 @@ func getIsuConditions(c echo.Context) error {
 func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
 	limit int, isuName string) ([]*GetIsuConditionResponse, error) {
 
-	// 条件レベルに応じたWHERE条件を構築
-	conditionWhere := ""
-	if len(conditionLevel) > 0 {
-		conditionClauses := []string{}
-		for level := range conditionLevel {
-			switch level {
-			case "info":
-				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) = 0)")
-			case "warning":
-				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) IN (4, 8))")
-			case "critical":
-				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) = 12)")
-			}
-		}
-		if len(conditionClauses) > 0 {
-			conditionWhere = " AND (" + strings.Join(conditionClauses, " OR ") + ")"
-		}
-	}
-
 	conditions := []IsuCondition{}
 	var err error
 
@@ -1039,20 +1049,16 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 		err = db.Select(&conditions,
 			"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
 				"	AND `timestamp` < ?"+
-				conditionWhere+
-				"	ORDER BY `timestamp` DESC"+
-				"   LIMIT ?",
-			jiaIsuUUID, endTime, limit,
+				"	ORDER BY `timestamp` DESC",
+			jiaIsuUUID, endTime,
 		)
 	} else {
 		err = db.Select(&conditions,
 			"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
 				"	AND `timestamp` < ?"+
 				"	AND ? <= `timestamp`"+
-				conditionWhere+
-				"	ORDER BY `timestamp` DESC"+
-				"   LIMIT ?",
-			jiaIsuUUID, endTime, startTime, limit,
+				"	ORDER BY `timestamp` DESC",
+			jiaIsuUUID, endTime, startTime,
 		)
 	}
 	if err != nil {
@@ -1066,16 +1072,22 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 			continue
 		}
 
-		data := GetIsuConditionResponse{
-			JIAIsuUUID:     c.JIAIsuUUID,
-			IsuName:        isuName,
-			Timestamp:      c.Timestamp.Unix(),
-			IsSitting:      c.IsSitting,
-			Condition:      c.Condition,
-			ConditionLevel: cLevel,
-			Message:        c.Message,
+		if _, ok := conditionLevel[cLevel]; ok {
+			data := GetIsuConditionResponse{
+				JIAIsuUUID:     c.JIAIsuUUID,
+				IsuName:        isuName,
+				Timestamp:      c.Timestamp.Unix(),
+				IsSitting:      c.IsSitting,
+				Condition:      c.Condition,
+				ConditionLevel: cLevel,
+				Message:        c.Message,
+			}
+			conditionsResponse = append(conditionsResponse, &data)
 		}
-		conditionsResponse = append(conditionsResponse, &data)
+	}
+
+	if len(conditionsResponse) > limit {
+		conditionsResponse = conditionsResponse[:limit]
 	}
 
 	return conditionsResponse, nil
@@ -1221,6 +1233,9 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
+	valueStrings := make([]string, 0, len(req))
+	valueArgs := make([]interface{}, 0, len(req)*5) // 5カラム * レコード数
+
 	for _, cond := range req {
 		timestamp := time.Unix(cond.Timestamp, 0)
 
@@ -1228,22 +1243,28 @@ func postIsuCondition(c echo.Context) error {
 			return c.String(http.StatusBadRequest, "bad request body")
 		}
 
-		_, err = tx.Exec(
-			"INSERT INTO `isu_condition`"+
-				"	(`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`)"+
-				"	VALUES (?, ?, ?, ?, ?)",
-			jiaIsuUUID, timestamp, cond.IsSitting, cond.Condition, cond.Message)
-		if err != nil {
-			c.Logger().Errorf("db error: %v", err)
-			return c.NoContent(http.StatusInternalServerError)
-		}
+		valueStrings = append(valueStrings, "(?, ?, ?, ?, ?)")
+		valueArgs = append(valueArgs, jiaIsuUUID, timestamp, cond.IsSitting, cond.Condition, cond.Message)
 
+	}
+
+	// SQLクエリの構築
+	stmt := fmt.Sprintf(
+		"INSERT INTO `isu_condition` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`) VALUES %s",
+		strings.Join(valueStrings, ","),
+	)
+
+	_, err = tx.Exec(stmt, valueArgs...)
+
+	if err != nil {
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
 	}
 
 	err = tx.Commit()
 	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+		c.Logger().Errorf("db error on Commit: %v", err)
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to commit transaction")
 	}
 
 	return c.NoContent(http.StatusAccepted)
