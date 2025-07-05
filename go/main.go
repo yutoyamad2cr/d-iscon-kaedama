@@ -1004,6 +1004,25 @@ func getIsuConditions(c echo.Context) error {
 func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
 	limit int, isuName string) ([]*GetIsuConditionResponse, error) {
 
+	// 条件レベルに応じたWHERE条件を構築
+	conditionWhere := ""
+	if len(conditionLevel) > 0 {
+		conditionClauses := []string{}
+		for level := range conditionLevel {
+			switch level {
+			case "info":
+				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) = 0)")
+			case "warning":
+				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) IN (4, 8))")
+			case "critical":
+				conditionClauses = append(conditionClauses, "(LENGTH(`condition`) - LENGTH(REPLACE(`condition`, 'true', '')) = 12)")
+			}
+		}
+		if len(conditionClauses) > 0 {
+			conditionWhere = " AND (" + strings.Join(conditionClauses, " OR ") + ")"
+		}
+	}
+
 	conditions := []IsuCondition{}
 	var err error
 
@@ -1011,18 +1030,20 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 		err = db.Select(&conditions,
 			"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
 				"	AND `timestamp` < ?"+
+				conditionWhere+
 				"	ORDER BY `timestamp` DESC"+
 				"   LIMIT ?",
-			jiaIsuUUID, endTime, limit*3,
+			jiaIsuUUID, endTime, limit,
 		)
 	} else {
 		err = db.Select(&conditions,
 			"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ?"+
 				"	AND `timestamp` < ?"+
 				"	AND ? <= `timestamp`"+
+				conditionWhere+
 				"	ORDER BY `timestamp` DESC"+
 				"   LIMIT ?",
-			jiaIsuUUID, endTime, startTime, limit*3,
+			jiaIsuUUID, endTime, startTime, limit,
 		)
 	}
 	if err != nil {
@@ -1033,43 +1054,19 @@ func getIsuConditionsFromDB(db *sqlx.DB, jiaIsuUUID string, endTime time.Time, c
 	for _, c := range conditions {
 		cLevel, err := calculateConditionLevel(c.Condition)
 		if err != nil {
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
-			fmt.Println("=========================================================")
 			continue
 		}
 
-		if _, ok := conditionLevel[cLevel]; ok {
-			data := GetIsuConditionResponse{
-				JIAIsuUUID:     c.JIAIsuUUID,
-				IsuName:        isuName,
-				Timestamp:      c.Timestamp.Unix(),
-				IsSitting:      c.IsSitting,
-				Condition:      c.Condition,
-				ConditionLevel: cLevel,
-				Message:        c.Message,
-			}
-			conditionsResponse = append(conditionsResponse, &data)
+		data := GetIsuConditionResponse{
+			JIAIsuUUID:     c.JIAIsuUUID,
+			IsuName:        isuName,
+			Timestamp:      c.Timestamp.Unix(),
+			IsSitting:      c.IsSitting,
+			Condition:      c.Condition,
+			ConditionLevel: cLevel,
+			Message:        c.Message,
 		}
-	}
-
-	if len(conditionsResponse) > limit {
-		conditionsResponse = conditionsResponse[:limit]
+		conditionsResponse = append(conditionsResponse, &data)
 	}
 
 	return conditionsResponse, nil
